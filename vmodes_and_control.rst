@@ -64,8 +64,7 @@ matrix:
 
 where the weights :math:`w_i` are read from the
 ``normalization_weights`` configuration file (for details see
-`Martínez-Galarza et al. 2024 <https://ui.adsabs.harvard.edu/abs/2024ApJ...974..108M>`_,
-Eqs. 9--11).
+`Megias Homar, G. et al. 2024 <https://ui.adsabs.harvard.edu/abs/2024ApJ...974..108M>`_, Eqs. 9--11).
 
 The **normalized sensitivity matrix** is:
 
@@ -92,6 +91,8 @@ via regularized pseudo-inversion.  There are two main approaches:
 both for optimal state estimation.
 
 
+.. _Problem setup:
+
 Problem setup
 ^^^^^^^^^^^^^
 
@@ -102,9 +103,40 @@ The residual wavefront error used as input is:
    \mathbf{y} = \mathbf{y}_\text{meas} - \mathbf{y}_\text{intrinsic}
                 - \mathbf{y}_2
 
-where :math:`\mathbf{y}_\text{intrinsic}` contains the design (intrinsic)
-Zernike coefficients for the current filter and sensor positions, and
-:math:`\mathbf{y}_2` is a static correction term.
+These subtractions operate in **measurement space** (Zernike coefficients at
+each sensor, :math:`\mathbf{y} \in \mathbb{R}^m`):
+
+- :math:`\mathbf{y}_\text{intrinsic}` contains the design (intrinsic) Zernike
+  coefficients for the current filter and sensor positions.  These represent
+  the wavefront error that the optical design produces even when the optics are
+  in perfect alignment (:math:`\mathbf{x} = \mathbf{0}`).  When
+  ``subtract_intrinsics = True`` (the default for the main closed-loop path),
+  these are subtracted so the residual :math:`\mathbf{y}` reflects only the
+  misalignment component.
+
+- :math:`\mathbf{y}_2` is a **static per-sensor correction** in measurement
+  space.  In the deployed configuration (``lsst_y2.yaml``), only the Z4
+  (focus) entries for the corner wavefront sensors are non-zero (e.g.,
+  R00: -0.139 um, R44: -0.145 um).  These values were determined from on-sky
+  data as the focus offsets at which the best image quality is achieved.
+
+The purpose of these subtractions is to ensure that when the telescope is at
+the desired alignment state (:math:`\mathbf{x} = \mathbf{0}` in DOF space),
+the residual :math:`\mathbf{y} \approx \mathbf{0}`.  The state estimator
+then inverts :math:`\mathbf{y}` to produce the DOF estimate :math:`\hat{\mathbf{x}}`.
+The PID controller operates in **DOF space** (:math:`\mathbf{x} \in \mathbb{R}^n`)
+with a setpoint of zero (see `PID control`_ below).  So the full chain is:
+
+1. Subtract known contributions in y-space:
+   :math:`\mathbf{y} = \mathbf{y}_\text{meas} - \mathbf{y}_\text{intrinsic} - \mathbf{y}_2`
+2. Estimate the DOF state: :math:`\hat{\mathbf{x}} = f(\mathbf{y})`
+3. PID drives :math:`\hat{\mathbf{x}} \to \mathbf{0}` (the setpoint in x-space)
+
+The y-space subtractions and the x-space setpoint work together: the
+subtractions define what "zero misalignment" looks like in measurement space,
+and the PID targets zero in DOF space.  If the y2 values were wrong (e.g.,
+the focus offsets didn't correspond to best image quality), the system would
+converge to a suboptimal state even though the PID error would be zero.
 
 We seek to solve:
 
@@ -442,82 +474,260 @@ estimate for v-modes 12--21 is effectively zero because their singular
 values were zeroed in the truncated sensitivity matrix.
 
 
+.. _PID control:
+
 PID control
 -----------
 
 The PID controller computes a correction :math:`\mathbf{u}_k` at each
 iteration :math:`k` based on the estimated state.  The correction is
-applied with negative feedback: the telescope moves in the opposite
+applied with **negative feedback**: the telescope moves in the opposite
 direction of the estimated error.
+
+The overall flow in ``OFC.calculate_corrections()`` is:
+
+1. Estimate the optical state :math:`\hat{\mathbf{x}}_k` via the state estimator.
+2. Pass :math:`\hat{\mathbf{x}}_k` to the PID controller, which computes an
+   internal control signal.
+3. **Negate** the control signal: ``uk = -controller.control_step(...)``
+4. Aggregate the correction into the telescope state.
+
+The negation in step 3 ensures that if the estimated state indicates a positive
+defocus, the correction drives it back toward zero.
+
+
+The setpoint: what the PID targets
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The PID controller drives the estimated state toward a **setpoint vector**
+:math:`\mathbf{s} \in \mathbb{R}^{50}`, which specifies the desired value for
+each of the 50 possible degrees of freedom.  In the default configuration
+(``pid_controller.yaml``), all setpoint entries are zero:
+
+.. math::
+
+   \mathbf{s} = \mathbf{0}
+
+This means the controller targets a state where all DOF deviations are zero —
+i.e., the telescope optics are in their nominal alignment.  A non-zero setpoint
+would allow the controller to target a deliberate offset (e.g., intentional
+defocus for engineering purposes).
+
+**The effective target of the closed loop is not simply "zero physical DOFs."**
+The PID setpoint lives in DOF space (:math:`\mathbf{x}`), but what "zero" means
+depends on the measurement preprocessing (see `Problem setup`_ above).  Before
+state estimation, the intrinsic Zernikes and y2 correction are subtracted in
+measurement space (:math:`\mathbf{y}`).  The y2 correction encodes per-sensor
+focus offsets determined from on-sky data.
+
+The system converges when :math:`\hat{\mathbf{x}} = \mathbf{0}`, which
+corresponds to the measurement residual :math:`\mathbf{y} \approx \mathbf{0}`,
+which in turn means :math:`\mathbf{y}_\text{meas} \approx \mathbf{y}_\text{intrinsic} + \mathbf{y}_2`.
+So the telescope is driven to the state where its measured wavefront matches the
+intrinsic design prediction plus the empirical y2 offsets — i.e., the state that
+produces the best image quality as determined from on-sky calibration.
+
+Only the entries corresponding to the active DOFs (``dof_idx``) are used.
+
+
+PID formula (as implemented)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+At each iteration :math:`k`, the controller receives the estimated state
+:math:`\hat{\mathbf{x}}_k` (either in DOF or v-mode space) and computes:
+
+**Error signal:**
+
+.. math::
+
+   \mathbf{e}_k = \mathbf{s}[\text{dof\_idx}] - \hat{\mathbf{x}}_k
+
+**Integral with anti-windup:**
+
+.. math::
+
+   \mathbf{I}_k &= \mathbf{I}_{k-1} + \mathbf{e}_k \\
+   \mathbf{I}_k &\leftarrow \operatorname{clip}\bigl(
+       \mathbf{I}_k,\;
+       -\mathbf{I}_\text{max}[\text{dof\_idx}],\;
+       +\mathbf{I}_\text{max}[\text{dof\_idx}]
+   \bigr)
+
+The ``max_integral`` vector (default: 1.0 for all DOFs) prevents the integral
+from growing without bound during sustained errors (anti-windup protection).
+
+**Derivative with low-pass filter:**
+
+.. math::
+
+   \mathbf{d}_k^\text{raw} &= \mathbf{e}_k - \mathbf{e}_{k-1} \\
+   \mathbf{d}_k &= \alpha\,\mathbf{d}_k^\text{raw}
+                  + (1 - \alpha)\,\mathbf{d}_{k-1}
+
+where :math:`\alpha` is the ``derivative_filter_coeff``.  When
+:math:`\alpha = 1` (the default), no filtering is applied and the derivative
+is simply the difference between consecutive errors.  When
+:math:`\alpha < 1`, the derivative is smoothed with an exponential moving
+average to reduce sensitivity to noise.
+
+**Control output:**
+
+.. math::
+
+   \mathbf{u}_k^\text{pid} = \mathbf{K}_p\,\mathbf{e}_k
+                            + \mathbf{K}_i\,\mathbf{I}_k
+                            + \mathbf{K}_d\,\mathbf{d}_k
+
+where:
+
+- :math:`\mathbf{K}_p = \operatorname{diag}\!\bigl(k_{p,1}, \ldots, k_{p,n}\bigr)`
+  is the proportional gain (default: 0.7 for all DOFs),
+- :math:`\mathbf{K}_i = \operatorname{diag}\!\bigl(k_{i,1}, \ldots, k_{i,n}\bigr)`
+  is the integral gain (default: 0.0 — integral action disabled),
+- :math:`\mathbf{K}_d = \operatorname{diag}\!\bigl(k_{d,1}, \ldots, k_{d,n}\bigr)`
+  is the derivative gain (default: 0.1).
+
+The gains can be a scalar (applied uniformly to all DOFs) or an array (per-DOF
+tuning).  They are indexed by ``dof_idx`` to select only the active DOFs.
+
+The final correction applied to the telescope is:
+
+.. math::
+
+   \mathbf{u}_k = -\mathbf{u}_k^\text{pid}
+
+This negation, applied in ``OFC.calculate_corrections()``, converts the
+PID output (which points from state toward setpoint) into a physical correction
+(which drives the optics back toward the setpoint).
+
+
+Default configuration
+^^^^^^^^^^^^^^^^^^^^^
+
+The default PID parameters from ``pid_controller.yaml``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 20 50
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``kp``
+     - 0.7
+     - Proportional gain (scalar or per-DOF array)
+   * - ``ki``
+     - 0.0
+     - Integral gain (disabled by default)
+   * - ``kd``
+     - 0.1
+     - Derivative gain
+   * - ``derivative_filter_coeff``
+     - 1.0
+     - Low-pass filter coefficient (1.0 = no filtering)
+   * - ``setpoint``
+     - all zeros (50 elements)
+     - Target state for each DOF
+   * - ``max_integral``
+     - 1.0 (all DOFs)
+     - Anti-windup clipping limit
+
+**Physical meaning of gains:** :math:`k_p = 0.7` means "correct 70% of the
+estimated error per iteration."  :math:`k_d = 0.1` provides damping that
+reduces overshoot by opposing rapid changes in the error.  With
+:math:`k_i = 0`, there is no integral action by default — steady-state errors
+are not automatically eliminated across iterations.
+
+
+Controller state and history
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The controller maintains internal state between iterations:
+
+- **aggregated_state** (:math:`\mathbf{x}_\text{agg}`): the cumulative
+  correction applied to the telescope (initialized from ``dof_state0``).
+- **integral** (:math:`\mathbf{I}`): accumulated integral of the error.
+- **previous_error** (:math:`\mathbf{e}_{k-1}`): error from the previous step.
+- **filtered_derivative** (:math:`\mathbf{d}_{k-1}`): filtered derivative from
+  the previous step.
+
+The ``reset_history()`` method:
+
+1. Saves the current aggregated state as the new reference:
+   :math:`\mathbf{x}_0 \leftarrow \mathbf{x}_\text{agg}`.
+2. Zeros the integral, previous error, and filtered derivative.
+
+This is called when the closed loop is restarted with a new ``comp_dof_idx``
+configuration, effectively starting the PID fresh from the current telescope
+state.
 
 
 PID in DOF space
 ^^^^^^^^^^^^^^^^
 
-When ``control_vmodes = False``, the PID operates directly on DOF
-estimates.
+When ``control_vmodes = False``, the state estimator returns the optical state
+directly in DOF space:
 
 .. math::
 
-   \mathbf{e}_k &= \mathbf{s}[\text{dof\_idx}] - \hat{\mathbf{x}}_k \\
-   \mathbf{I}_k &= \mathbf{I}_{k-1} + \mathbf{e}_k \\
-   \mathbf{u}_k &= \mathbf{K}_p\,\mathbf{e}_k
-                  + \mathbf{K}_i\,\mathbf{I}_k
-                  + \mathbf{K}_d\,\mathbf{d}_k
+   \hat{\mathbf{x}}_k = \mathbf{N} \cdot
+     \bigl(\mathbf{C}_n^{-1/2}\,\tilde{\mathbf{A}}\bigr)_k^{+} \cdot
+     \mathbf{C}_n^{-1/2}\,\mathbf{y}
 
-where:
-
-- :math:`\mathbf{s}` is the setpoint vector (typically all zeros),
-- :math:`\hat{\mathbf{x}}_k` is the estimated DOF state at iteration
-  :math:`k`,
-- :math:`\mathbf{K}_p = \operatorname{diag}\!\bigl(k_{p,1}, \ldots, k_{p,n}\bigr)`
-  is the proportional gain matrix, indexed by DOF,
-- :math:`\mathbf{K}_i`, :math:`\mathbf{K}_d` are the integral and
-  derivative gain matrices (also diagonal, indexed by DOF),
-- :math:`\mathbf{I}_k` is the accumulated integral, clipped element-wise
-  by ``max_integral[dof_idx]``,
-- :math:`\mathbf{d}_k` is the filtered derivative of the error.
+The PID operates on this 22-dimensional (or however many DOFs are active)
+state vector.  Each gain entry corresponds directly to a physical DOF.
 
 **Physical meaning of DOF gains:** each diagonal entry of
 :math:`\mathbf{K}_p` controls the aggressiveness of correction for one
-physical DOF.  For example, :math:`k_{p,0} = 0.18` means "correct 18% of
+physical DOF.  For example, :math:`k_{p,0} = 0.7` means "correct 70% of
 the estimated M2 hexapod dZ error per iteration."
 
 
 PID in v-mode space
 ^^^^^^^^^^^^^^^^^^^
 
-When ``control_vmodes = True``, the OFC wraps the PID with v-mode
-transformations:
-
-**Step 1 — Project to v-modes.**  The estimated DOF state is converted to
-v-mode coordinates:
-
-.. math::
-
-   \hat{\mathbf{v}}_k = \mathbf{V}_h\,\mathbf{N}^{-1}\,\hat{\mathbf{x}}_k
-
-**Step 2 — PID in v-mode space.**  The controller computes:
+When ``control_vmodes = True``, the state estimator returns the optical
+state directly in v-mode space.  Internally, the state estimator solves
+the least-squares problem and returns the v-mode coefficients (zero-padded
+to the full DOF dimension):
 
 .. math::
 
-   \mathbf{e}^{(v)}_k &= \mathbf{s}^{(v)} - \hat{\mathbf{v}}_k \\
-   \mathbf{u}^{(v)}_k &= \mathbf{K}^{(v)}_p\,\mathbf{e}^{(v)}_k
-                        + \mathbf{K}^{(v)}_i\,\mathbf{I}^{(v)}_k
-                        + \mathbf{K}^{(v)}_d\,\mathbf{d}^{(v)}_k
+   \hat{\mathbf{v}}_k = \text{pad}_{n}\bigl(\mathbf{v}_\text{state}\bigr)
 
-where :math:`\mathbf{K}^{(v)}_p`, :math:`\mathbf{K}^{(v)}_i`, and
-:math:`\mathbf{K}^{(v)}_d` are the gain matrices applied in v-mode space.
+where :math:`\mathbf{v}_\text{state}` has dimension equal to the number of
+retained modes (truncation index), padded with zeros for the discarded modes.
 
-**Step 3 — Project back to DOFs.**  The v-mode correction is converted to
-physical DOF corrections:
+The PID then operates on this v-mode vector using the **same** ``calculate_pid_step()``
+method — the controller does not know whether it is operating on DOFs or v-modes.
+The error, integral, and derivative are all computed in v-mode space:
 
 .. math::
 
-   \mathbf{u}_k = \mathbf{N}\,\mathbf{V}_h^{T}\,\mathbf{u}^{(v)}_k
+   \mathbf{e}^{(v)}_k &= \mathbf{s}[\text{dof\_idx}] - \hat{\mathbf{v}}_k \\
+   \mathbf{u}^{(v)}_k &= \mathbf{K}_p[\text{dof\_idx}]\,\mathbf{e}^{(v)}_k
+                        + \mathbf{K}_i[\text{dof\_idx}]\,\mathbf{I}^{(v)}_k
+                        + \mathbf{K}_d[\text{dof\_idx}]\,\mathbf{d}^{(v)}_k
+
+After the PID produces :math:`\mathbf{u}^{(v)}_k`, the OFC converts it back
+to physical DOF corrections:
+
+.. math::
+
+   \mathbf{u}_k = -\mathbf{N}\,\mathbf{V}_{h,k}^{T}\,\mathbf{u}^{(v)}_k[\text{:truncate\_index}]
+
+This uses ``get_dofs_from_vmodes()``, which takes the first ``truncate_index``
+elements of the v-mode correction, multiplies by :math:`\mathbf{V}_{h,k}^T` to
+project to normalized DOF space, then de-normalizes with :math:`\mathbf{N}`.
+
+**Important implementation detail:** because the PID uses the same gain
+arrays indexed by ``dof_idx`` regardless of whether it operates on DOFs or
+v-modes, the gain at position :math:`i` applies to v-mode :math:`i` (ordered
+by singular value).  This means v-mode 0 (highest optical leverage) gets the
+gain at ``dof_idx[0]``, v-mode 1 gets the gain at ``dof_idx[1]``, and so on.
 
 **Physical meaning of v-mode gains:** each entry of
-:math:`\mathbf{K}^{(v)}_p` controls how aggressively a specific optical
+:math:`\mathbf{K}_p` controls how aggressively a specific optical
 mode is corrected.  For example, assigning a higher gain to v-mode 0
 (focus) means the system corrects focus errors more aggressively than
 higher-order aberrations.
